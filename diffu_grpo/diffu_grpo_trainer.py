@@ -51,7 +51,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
         kwargs["args"].beta = 0.0
         super().__init__(**kwargs)
         self.beta = beta
-
         self.model_wrapped = self.model_wrapped.to(torch.bfloat16)
 
     def _generate_and_score_completions(
@@ -153,7 +152,6 @@ class DiffuGRPOTrainer(GRPOTrainer):
             prompt_ids,
             prompt_mask,
         )
-
         # Rollout
         with (
             profiling_context(self, "transformers.generate"),
@@ -189,10 +187,9 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 use_scheduler=self.args.use_scheduler,
             )
             logger.info("Rollout completed")
-            if (
-                self.args.torch_empty_cache_steps is not None
-                and self.state.global_step % self.args.torch_empty_cache_steps == 0
-            ):
+
+            # let deepspeed manage cuda cache 
+            if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
                 torch.cuda.empty_cache()
 
         # Compute prompt length and extract completion ids
@@ -243,22 +240,12 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 example["student_logprob"] = logprob
 
         with torch.no_grad():
-            # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
-            # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
-            # **samples** may come from an earlier version of the model. In that case, we need to track old_per_token_logps
-            # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-            # old_per_token_logps to None.
-            # This will only run when self._step % generate_every == 0 or self._buffered_inputs is None
-            # generate_every = (
-            #     self.args.steps_per_generation * self.num_iterations
-            # )  # generation frequency
+            # In the diffusion setting we already have per-token log-probs for the rollout trajectory (`sequence_logp`)
+            # computed in `generate`. We always reuse them as `old_per_token_logps` so that we can explicitly
+            # measure and correct any on/off-policy mismatch during replay.
             old_per_token_logps = sequence_logp.clone().detach()
-            # if self.args.gradient_accumulation_steps % generate_every != 0:
-            #     old_per_token_logps = sequence_logp.clone().detach()
-            # else:
-            #     old_per_token_logps = None
 
-            # Compute the per-token log probabilities for the reference model
+            # Compute the per-token log probabilities for the reference model when KL regularization is enabled.
             if self.beta != 0.0:
                 ref_per_token_logps = old_per_token_logps.clone().detach()
             else:
@@ -373,15 +360,20 @@ class DiffuGRPOTrainer(GRPOTrainer):
         )
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
+        # Only log mean to wandb; std metrics are commented out for cleaner display.
         for i, reward_func_name in enumerate(self.reward_func_names):
             mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/mean"].append(mean_rewards)
-            std_func_rewards = nanstd(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}/std"].append(
-                std_func_rewards
-            )
-        self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
+            # std_func_rewards = nanstd(rewards_per_func[:, i]).item()
+            # self._metrics[mode][f"rewards/{reward_func_name}/std"].append(
+            #     std_func_rewards
+            # )
+        self._metrics[mode].setdefault("overall_reward", []).append(
+            mean_grouped_rewards.mean().item()
+        )
+        # self._metrics[mode].setdefault("overall_reward_std", []).append(
+        #     std_rewards.mean().item()
+        # )
         self._metrics[mode]["frac_reward_zero_std"].append(
             is_std_zero.float().mean().item()
         )
@@ -452,16 +444,10 @@ class DiffuGRPOTrainer(GRPOTrainer):
             inputs["completion_mask"],
         )
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        # Replay must mirror the rollout mask: during generation only the prompt tokens
-        # were marked as valid, so keep zeros on the completion portion.
-        prompt_only_mask = torch.ones_like(prompt_ids, dtype=prompt_mask.dtype)
-        attention_mask = torch.cat(
-            [
-                prompt_only_mask,
-                torch.zeros_like(completion_ids, dtype=prompt_mask.dtype),
-            ],
-            dim=1,
-        )
+        # Replay must mirror the rollout mask used during generation:
+        # prompt padding is preserved, completion tokens are treated as valid (non-padding) tokens.
+        attention_mask = torch.ones_like(input_ids, dtype=prompt_mask.dtype)
+        attention_mask[:, :prompt_len] = prompt_mask
         sampling_traj = inputs["sampling_traj"]
         x0_hist = inputs["x0_hist"]
         all_advantages = inputs["advantages"]
@@ -469,8 +455,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
         # attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
         # chunk inputs into smaller batches to reduce memory peak
-        batch_size = input_ids.size(0) // 2
-        assert input_ids.size(0) % batch_size == 0
+        batch_size = input_ids.size(0) // self.args.loss_chunk_divisor
+        assert batch_size > 0 and input_ids.size(0) % batch_size == 0
         return_loss = 0.0
         loss_list = []
         for start in range(0, input_ids.size(0), batch_size):
@@ -483,17 +469,13 @@ class DiffuGRPOTrainer(GRPOTrainer):
 
             all_traj_len = self.accelerator.gather(
                 torch.tensor(traj_len, device=input_ids_batch.device)
-            )
+            ) 
             max_traj_len = all_traj_len.max().item()
 
             mask_id = self.args.mask_id
             cur_input = input_ids_batch.clone()
             cur_input[:, prompt_len:] = mask_id
-            if (
-                self.args.torch_empty_cache_steps is not None
-                and self.state.global_step % self.args.torch_empty_cache_steps == 0
-            ):
-                torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
             for step in tqdm(range(max_traj_len), desc="Computing per-token logps"):
                 # logger.info(f"Step {step} of {traj_len}")
                 # running the model in batches per step
@@ -546,14 +528,19 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         cur_logp = torch.zeros_like(
                             unmasking_prob[batch], dtype=torch.float32
                         ).unsqueeze(0)
+                        EPS = 1e-6
+                        clamped_prob = torch.clamp(unmasking_prob[batch], min=EPS, max=1.0 - EPS)
                         if len(cur_traj[batch][step]) > 0:
+                            # Use log1p for log(1-p) when p is small
                             cur_logp[:, keep_mask_index_mask] = torch.log1p(
-                                -unmasking_prob[batch, keep_mask_index_mask]
+                                -clamped_prob[keep_mask_index_mask]
                             )
+                            # Use log for log(p), now safe due to clamping
                             cur_logp[:, unmasking_index_mask] = (
-                                torch.log(unmasking_prob[batch, unmasking_index_mask])
+                                torch.log(clamped_prob[unmasking_index_mask])
                                 + x0_logp[batch, unmasking_index_mask]
                             )
+
                         if (
                             torch.isnan(cur_logp).sum() > 0
                             or not torch.isfinite(cur_logp).all()
@@ -620,12 +607,8 @@ class DiffuGRPOTrainer(GRPOTrainer):
                     # Two-sided clipping
                     if self.args.delta is not None:
                         coef_1 = torch.clamp(coef_1, max=self.args.delta)
-                    advantages = torch.where(
-                        advantages < self.args.advantage_min_clip,
-                        torch.zeros_like(
-                            advantages
-                        ),  # ignores advantages below a threshold
-                        advantages,
+                    advantages = torch.clamp(
+                        advantages, min=self.args.advantage_min_clip
                     )
 
                     per_token_loss1 = coef_1 * advantages.unsqueeze(1)
@@ -640,7 +623,7 @@ class DiffuGRPOTrainer(GRPOTrainer):
                         / per_token_loss.size(0)
                         / self.max_completion_length
                     )
-                    loss = loss / self.current_gradient_accumulation_steps
+
                     if loss.grad_fn is None:
                         # this means that no token is unmasked, this can happen because generated completion rollout is splitted into smaller batches
                         # raise ValueError("No gradient found")
@@ -650,11 +633,19 @@ class DiffuGRPOTrainer(GRPOTrainer):
                 # Backward pass
                 if bad_flag or loss.isnan():
                     accel_break(bad_process_index)
-                # logger.info(f"[Rank {self.accelerator.process_index}]Loss: {loss}")
-                self.backward(loss, num_items_in_batch)
+
+                # Backward pass: accumulate gradients over diffusion steps but only let DeepSpeed
+                # take an optimizer step on the final (chunk, step) pair.
+                force_deepspeed_step = False
+                if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                    is_last_chunk = start + batch_size == input_ids.size(0)
+                    is_last_step = step == max_traj_len - 1
+                    force_deepspeed_step = is_last_chunk and is_last_step
+                self.backward(loss, num_items_in_batch, force_deepspeed_step=force_deepspeed_step)
                 return_loss += loss.detach()
 
                 del cur_input
+                # torch.cuda.empty_cache() # to reduce memory usage but will make things super slow
                 cur_input = next_input
 
                 # Log the metrics
@@ -758,11 +749,45 @@ class DiffuGRPOTrainer(GRPOTrainer):
         else:
             return self._compute_loss(model, inputs, num_items_in_batch)
 
-    def backward(self, loss: torch.Tensor, num_items_in_batch):
+    def backward(self, loss: torch.Tensor, num_items_in_batch, force_deepspeed_step=False):
+        if (force_deepspeed_step and self.accelerator.distributed_type != DistributedType.DEEPSPEED):
+            raise ValueError("force_deepspeed_step should only be true during DeepSpeed runs")
+        
         kwargs = {}
 
+        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+            ds_engine = self.model
+
+            # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled.
+            # DeepSpeed's engine.backward() already divides loss by gradient_accumulation_steps;
+            # without this, Accelerator.backward() would scale it a second time.
+            # https://github.com/huggingface/transformers/pull/35808
+            kwargs["scale_wrt_gas"] = False
+
+            # ZeRO-3 performs gradient reduce-scatter during backward via hooks.
+            # With gradient_accumulation_steps=1, every backward() is treated as
+            # an accumulation boundary, causing each reduce-scatter to overwrite
+            # the previous gradient partition. We must mark only the final backward
+            # as the boundary so intermediate gradients accumulate locally.
+            if hasattr(ds_engine, 'set_gradient_accumulation_boundary'):
+                ds_engine.set_gradient_accumulation_boundary(force_deepspeed_step)
+            elif hasattr(ds_engine, '_is_gradient_accumulation_boundary'):
+                ds_engine._is_gradient_accumulation_boundary = force_deepspeed_step
+
+            orig_sync = getattr(self.accelerator, "sync_gradients", True)
+            self.accelerator.sync_gradients = force_deepspeed_step
+            self.accelerator.backward(loss, **kwargs)
+            self.accelerator.sync_gradients = orig_sync
+            return
+
+        if (
+            self.args.torch_empty_cache_steps is not None
+            and self.state.global_step % self.args.torch_empty_cache_steps == 0
+        ):
+            torch.cuda.empty_cache()
+
         if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training (non-deepspeed)
 
         # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss
         if (
@@ -770,10 +795,5 @@ class DiffuGRPOTrainer(GRPOTrainer):
         ) and self.compute_loss_func is None:
             # If the model does not accept loss kwargs, we need to normalize the loss by the number of gradient accumulation steps
             loss = loss / self.current_gradient_accumulation_steps
-
-        # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
-        # https://github.com/huggingface/transformers/pull/35808
-        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
-            kwargs["scale_wrt_gas"] = False
 
         self.accelerator.backward(loss, **kwargs)

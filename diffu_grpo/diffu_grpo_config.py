@@ -78,9 +78,23 @@ class DiffuGRPOConfig(GRPOConfig):
             "help": "When true, pass student logprobs to calculate reverse KL for on-policy distillation."
         },
     )
+    loss_chunk_divisor: int = field(
+        default=2,
+        metadata={
+            "help": "Divisor to split the per-device batch during loss computation. "
+            "per_device_train_batch_size must be divisible by this value. "
+            "Higher values reduce memory peak at the cost of more loop iterations."
+        },
+    )
     local_log_path: str | None = field(
         default=None,
         metadata={
             "help": "Optional path to a JSONL file where training logs are written locally.",
+        },
+    )
+    teacher_device: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional device (e.g. 'cuda:0') for the verifier/teacher model. If set, DIFFUGRPO_TEACHER_DEVICE env var is set for reward loading.",
         },
     )

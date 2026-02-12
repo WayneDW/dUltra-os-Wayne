@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -18,12 +19,29 @@ def _get_teacher(model_name: str) -> tuple[AutoTokenizer, AutoModelForCausalLM]:
     """Load (or reuse) the verifier teacher model and tokenizer."""
     if model_name not in _teacher_cache:
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-        ).eval()
+        teacher_device = os.environ.get(
+            "DIFFUGRPO_TEACHER_DEVICE",
+            f"cuda:{torch.cuda.current_device()}",
+        )
+        # Temporarily hide the HF DeepSpeed config so that from_pretrained
+        # uses the normal loading path instead of ZeRO-3's partitioned path.
+        _ds_mod = None
+        _saved_ref = None
+        try:
+            import transformers.integrations.deepspeed as _ds_mod
+            _saved_ref = getattr(_ds_mod, "_hf_deepspeed_config_weak_ref", None)
+            _ds_mod._hf_deepspeed_config_weak_ref = None
+        except (ImportError, AttributeError):
+            pass
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+            ).eval().to(teacher_device)
+        finally:
+            if _ds_mod is not None and _saved_ref is not None:
+                _ds_mod._hf_deepspeed_config_weak_ref = _saved_ref
         _teacher_cache[model_name] = (tokenizer, model)
     return _teacher_cache[model_name]
 
@@ -44,7 +62,7 @@ def _select_teacher_domain(kwargs: dict) -> str:
 
 
 @torch.no_grad()
-def verifier_reward(prompts, completions, **kwargs):
+def verifier_distillation_reward(prompts, completions, **kwargs):
     teacher_domain = _select_teacher_domain(kwargs)
     tokenizer, model = _get_teacher(TEACHER_MODELS[teacher_domain])
     student_logprobs = kwargs.get("student_logprob")

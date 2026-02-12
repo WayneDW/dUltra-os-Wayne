@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 import torch
-from accel_reward import gen_step_reward, verifier_reward
+from accel_reward import gen_step_reward, verifier_distillation_reward
 from accelerate import PartialState
 from data_utils import (
     get_apps_questions,
@@ -32,7 +32,6 @@ from trl import ModelConfig, TrlParser
 
 from model.llada.configuration_llada import LLaDAConfig
 from model.llada.lladou import LLaDOUModelLM
-from model.path_utils import lladou_config_dir
 from utils import set_random_seed
 
 logging.set_verbosity_info()
@@ -142,7 +141,7 @@ def main(grpo_config, model_config):
     reward_weights.append(gen_step_reward_weight)
 
     # on policy distill reward
-    reward_functions.append(verifier_reward)
+    reward_functions.append(verifier_distillation_reward)
     reward_weights.append(1.0)
 
     # Shuffle dataset with fixed seed for reproducibility
@@ -165,41 +164,55 @@ def main(grpo_config, model_config):
     # we need to first get the local dir, otherwise there is a chance of network error when downloading the model in parallel
     local_dir = ""
     state = PartialState()
-    if state.is_main_process:
-        local_dir = snapshot_download(grpo_config.model_path)
-    state.wait_for_everyone()
-    local_dir = snapshot_download(grpo_config.model_path)
-
-    if grpo_config.use_official_model:
-        model = AutoModel.from_pretrained(
-            local_dir,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            quantization_config=bnb_config,
-        )
+    if os.path.isdir(grpo_config.model_path):
+        local_dir = grpo_config.model_path
     else:
-        # if "llada" in grpo_config.model_path.lower():
-        #     llada_config = LLaDAConfig.from_pretrained(
-        #         Path("../model/llada/config.json")
-        #     )
-        #     assert llada_config.flash_attention
-        #     model = LLaDAModelLM.from_pretrained(
-        #         local_dir,
-        #         config=llada_config,
-        #         trust_remote_code=True,
-        #         torch_dtype=torch.bfloat16,
-        #         quantization_config=bnb_config,
-        #     )
-        # elif "lladou" in grpo_config.model_path.lower():
-        lladou_config = LLaDAConfig.from_pretrained(lladou_config_dir())
-        assert lladou_config.flash_attention
-        model = LLaDOUModelLM.from_pretrained(
-            local_dir,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            quantization_config=bnb_config,
-            config=lladou_config,
-        )
+        if state.is_main_process:
+            local_dir = snapshot_download(grpo_config.model_path)
+        state.wait_for_everyone()
+        # All ranks need local_dir; non-main ranks skip the download above.
+        # Second call hits the HF cache and returns the path without re-downloading.
+        local_dir = snapshot_download(grpo_config.model_path)
+
+    repo_root = Path(__file__).resolve().parent.parent
+
+    # Temporarily hide the HF DeepSpeed config so that from_pretrained uses
+    # the normal weight-loading path. With zero_stage=3, transformers would
+    # otherwise create the model on the meta device and expect
+    # deepspeed.zero.Init to fill the weights — but with zero3_init_flag=false
+    # that context is absent, leaving the model with empty parameters.
+    _ds_mod = None
+    _saved_ref = None
+    try:
+        import transformers.integrations.deepspeed as _ds_mod
+        _saved_ref = getattr(_ds_mod, "_hf_deepspeed_config_weak_ref", None)
+        _ds_mod._hf_deepspeed_config_weak_ref = None
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        if grpo_config.use_official_model:
+            model = AutoModel.from_pretrained(
+                local_dir,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                quantization_config=bnb_config,
+            )
+        else:
+            lladou_config = LLaDAConfig.from_pretrained(
+                repo_root / "model/llada/lladou_config"
+            )
+            assert lladou_config.flash_attention
+            model = LLaDOUModelLM.from_pretrained(
+                local_dir,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                quantization_config=bnb_config,
+                config=lladou_config,
+            )
+    finally:
+        if _ds_mod is not None and _saved_ref is not None:
+            _ds_mod._hf_deepspeed_config_weak_ref = _saved_ref
     with state.main_process_first():
         tokenizer = AutoTokenizer.from_pretrained(
             grpo_config.tokenizer_path, trust_remote_code=True, use_fast=True
@@ -238,6 +251,13 @@ def main(grpo_config, model_config):
         train_dataset=train_set,
         processing_class=tokenizer,
     )
+
+    # Propagate teacher device preference (if any) so accel_reward can honor it
+    # when loading the verifier/teacher model.
+    if grpo_config.teacher_device is not None:
+        os.environ["DIFFUGRPO_TEACHER_DEVICE"] = grpo_config.teacher_device
+    else:
+        os.environ.pop("DIFFUGRPO_TEACHER_DEVICE", None)
 
     local_log_path = grpo_config.local_log_path or os.path.join(
         grpo_config.output_dir, "local_training_logs.jsonl"

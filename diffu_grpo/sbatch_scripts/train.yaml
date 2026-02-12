@@ -26,6 +26,7 @@ weight_decay: 0.1
 max_grad_norm: 1
 
 use_vllm: false # cannot use for dllm for now
+ds3_gather_for_generation: true
 
 warmup_ratio: 0.001
 learning_rate: 5e-6
@@ -56,7 +57,7 @@ save_total_limit: 5
 # resume_from_checkpoint:  # this is the dir to load from, not bool
 
 # Diffusion and GRPO-specific
-max_completion_length: 128
+max_completion_length: 256
 temperature: .1
 beta: 0.0
 epsilon: 0.2
